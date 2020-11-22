@@ -1,11 +1,13 @@
 import obspython as obs
 import mpd
+import string
 
 address = ""
 port = 0
 password = ""
 interval = 1000
 source_name = ""
+template = ""
 verbose = False
 
 initialized = False
@@ -14,6 +16,27 @@ signal_handler = None
 
 mpd_client = mpd.MPDClient()
 
+class PartialFormatter(string.Formatter):
+    def __init__(self, missing='', bad_fmt=''):
+        self.missing, self.bad_fmt=missing, bad_fmt
+
+    def get_field(self, field_name, args, kwargs):
+        # Handle a key not found
+        try:
+            val=super(PartialFormatter, self).get_field(field_name, args, kwargs)
+            # Python 3, 'super().get_field(field_name, args, kwargs)' works
+        except (KeyError, AttributeError):
+            val=None,field_name
+        return val
+
+    def format_field(self, value, spec):
+        # handle an invalid format
+        if value==None: return self.missing
+        try:
+            return super(PartialFormatter, self).format_field(value, spec)
+        except ValueError:
+            if self.bad_fmt is not None: return self.bad_fmt
+            else: raise
 
 def script_description():
     return "Starts MPD playback when specific text source activates and updates its contents with the current song info. Playback is stopped when the source deactivates.\n\ngithub.com/ansse/OBS-MPD-Client"
@@ -65,6 +88,27 @@ def disconnect_mpd():
 
 
 def initialize_mpd():
+
+    connect_mpd()
+    if mpd_connected():
+        try:
+            mpd_client.stop()
+            mpd_client.clear()
+            mpd_client.update()
+            mpd_client.add("/")
+            mpd_client.random(1)
+            mpd_client.setvol(100)
+            mpd_client.repeat(1)
+            mpd_client.consume(0)
+            mpd_client.single(0)
+            mpd_client.command_list_ok_begin()
+            mpd_client.play()
+            mpd_client.stop()
+            mpd_client.command_list_end()
+
+        except Exception as e:
+            print("ERROR: initialization failed:\n", e)
+
     return
 
 def reconnect_pressed(props, prop):
@@ -85,7 +129,8 @@ def update_text():
             print("WARN: Connection to MPD lost. Clearing the text source")
             text = ""
         else:
-            text = "{artist}\n{title}".format(**mpd_client.currentsong())
+            fmt = PartialFormatter()
+            text = fmt.format(template, **mpd_client.currentsong())
 
 
         settings = obs.obs_data_create()
@@ -103,12 +148,15 @@ def script_properties():
     obs.obs_properties_add_int(props, "port", "MPD port number", 1, 65353, 1)
     obs.obs_properties_add_text(props, "password", "MPD password", obs.OBS_TEXT_PASSWORD)
 
-    obs.obs_properties_add_button(props, "reconnect", "Reconnect and reset", reconnect_pressed)
+    obs.obs_properties_add_button(props, "reconnect", "Reconnect and initialize", reconnect_pressed)
 
     obs.obs_properties_add_int(props, "interval", "Text update interval (milliseconds)", 100, 10000, 100)
 
     p = obs.obs_properties_add_list(props, "source", "Text source", obs.OBS_COMBO_TYPE_EDITABLE,
                                     obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_properties_add_int(props, "interval", "Text update interval (milliseconds)", 100, 10000, 100)
+    obs.obs_properties_add_text(props, "template", "Text template", obs.OBS_TEXT_MULTILINE)
+
     sources = obs.obs_enum_sources()
     if sources is not None:
         for source in sources:
@@ -129,6 +177,7 @@ def script_defaults(settings):
     obs.obs_data_set_default_int(settings, "interval", 1000)
     obs.obs_data_set_default_int(settings, "port", 6600)
     obs.obs_data_set_default_string(settings, "password", "")
+    obs.obs_data_set_default_string(settings, "template", "{artist} - {title}\n{album} - {date}")
 
 
 def script_update(settings):
@@ -139,6 +188,7 @@ def script_update(settings):
     global source_name
     global verbose
     global initialized
+    global template
 
     if verbose:
         print("Script updating.")
@@ -150,6 +200,7 @@ def script_update(settings):
     password = obs.obs_data_get_string(settings, "password")
     interval = obs.obs_data_get_int(settings, "interval")
     source_name = obs.obs_data_get_string(settings, "source")
+    template = obs.obs_data_get_string(settings, "template")
 
     obs.timer_remove(update_text)
 
@@ -159,7 +210,7 @@ def script_update(settings):
             initialize_mpd()
             initialized = True
 
-    if mpd_connected() and source_name != "":
+    if source_name != "":
         obs.timer_add(update_text, interval)
 
 
@@ -178,7 +229,7 @@ def source_activated(calldata):
             if not mpd_connected() and not connect_mpd():
                 print("ERROR: Connection to MPD lost. Cannot send play command.")
             else:
-                mpd_client.next()
+                mpd_client.play()
 
 
 def source_deactivated(calldata):
@@ -195,7 +246,13 @@ def source_deactivated(calldata):
             if not mpd_connected() and not connect_mpd():
                 print("ERROR: Connection to MPD lost. Cannot send stop command.")
             else:
-                mpd_client.pause(1)
+                try:
+                    mpd_client.command_list_ok_begin()
+                    mpd_client.next()
+                    mpd_client.stop()
+                    mpd_client.command_list_end()
+                except mpd.CommandError as e:
+                    print("WARN: skipping to next song failed:\n", e)
 
 
 
